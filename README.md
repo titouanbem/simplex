@@ -1,1 +1,434 @@
 # simplex
+\section{hpp}
+
+#pragma once
+
+#include <vector>
+
+namespace simplex {
+
+enum class Sense  { LessEqual, GreaterEqual, Equal };
+enum class Goal   { Maximize, Minimize };
+enum class Status { Optimal, Unbounded, Infeasible };
+
+struct Constraint {
+    std::vector<double> coeffs;
+    Sense               sense;
+    double              rhs;
+};
+
+struct Problem {
+    Goal                    goal = Goal::Maximize;
+    std::vector<double>     cost;
+    std::vector<Constraint> constraints;
+
+    int numVars()        const { return static_cast<int>(cost.size()); }
+    int numConstraints() const { return static_cast<int>(constraints.size()); }
+};
+
+struct Solution {
+    Status              status = Status::Infeasible;
+    std::vector<double> x;
+    double              value = 0.0;
+    int                 iterations = 0;
+};
+
+// Resout le programme lineaire. verbose=true affiche les tableaux intermediaires.
+Solution    solve(const Problem& problem, bool verbose = false);
+const char* toString(Status s);
+
+}  // namespace simplex
+
+
+\section{cpp}
+
+#include "simplex.hpp"
+
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <string>
+
+namespace simplex {
+namespace {   // <- tout ce qui est ici reste prive a ce fichier
+
+// ===========================================================================
+//  1. Le tableau du simplexe (type interne)
+// ===========================================================================
+
+constexpr double EPS = 1e-9;
+
+struct Tableau {
+    int m = 0;                            // nombre de contraintes (lignes)
+    int n = 0;                            // nombre total de colonnes (variables)
+    std::vector<std::vector<double>> a;   // a[i][j] : coefficients
+    std::vector<double>              b;   // b[i]    : second membre
+    std::vector<double>              r;   // r[j]    : couts reduits
+    double                           value = 0.0;   // valeur courante de z
+    std::vector<int>                 basis;         // basis[i] : variable en base ligne i
+    std::vector<std::string>         names;         // names[j] : pour l'affichage
+
+    int numOriginalVars = 0;   // pour extraire x a la fin
+    int firstArtificial = 0;   // debut des colonnes artificielles (= n si aucune)
+};
+
+// ===========================================================================
+//  2. Le moteur
+// ===========================================================================
+
+// Renvoie l'indice de la colonne entrante, ou -1 si l'optimum est atteint.
+// On ne cherche que parmi les colonnes < maxCol (utile en phase 2 pour
+// interdire les colonnes artificielles).
+int chooseEnteringColumn(const Tableau& t, int maxCol) {
+    int    best      = -1;
+    double bestValue = -EPS;          // seuil : il faut r[j] < -EPS
+
+    for (int j = 0; j < maxCol; ++j) {
+        if (t.r[j] < bestValue) {
+            bestValue = t.r[j];
+            best      = j;
+        }
+    }
+    return best;
+}
+
+// Test du rapport. Renvoie la ligne sortante, ou -1 si le probleme est non borne.
+int chooseLeavingRow(const Tableau& t, int col) {
+    int    best      = -1;
+    double bestRatio = 0.0;
+
+    for (int i = 0; i < t.m; ++i) {
+        if (t.a[i][col] <= EPS) continue;      // seuls les coefficients > 0 limitent
+
+        const double ratio = t.b[i] / t.a[i][col];
+
+        if (best == -1) {
+            best = i;  bestRatio = ratio;
+        } else if (ratio < bestRatio - EPS) {
+            best = i;  bestRatio = ratio;      // strictement meilleur
+        } else if (ratio < bestRatio + EPS && t.basis[i] < t.basis[best]) {
+            best = i;  bestRatio = ratio;      // egalite : plus petit indice (Bland)
+        }
+    }
+    return best;
+}
+
+void pivot(Tableau& t, int row, int col) {
+    const double p = t.a[row][col];
+
+    // 1. normaliser la ligne pivot pour que le pivot vaille 1
+    for (int j = 0; j < t.n; ++j) t.a[row][j] /= p;
+    t.b[row] /= p;
+    t.a[row][col] = 1.0;                    // impose exactement, evite la derive
+
+    // 2. annuler la colonne dans toutes les autres lignes
+    for (int i = 0; i < t.m; ++i) {
+        if (i == row) continue;
+        const double factor = t.a[i][col];
+        for (int j = 0; j < t.n; ++j) t.a[i][j] -= factor * t.a[row][j];
+        t.b[i] -= factor * t.b[row];
+        t.a[i][col] = 0.0;                  // impose exactement
+    }
+
+    // 3. annuler la colonne dans la ligne objectif
+    const double rc = t.r[col];
+    for (int j = 0; j < t.n; ++j) t.r[j] -= rc * t.a[row][j];
+    t.value -= rc * t.b[row];
+    t.r[col] = 0.0;
+
+    // 4. la variable entrante remplace la sortante dans la base
+    t.basis[row] = col;
+}
+
+Status runSimplex(Tableau& t, int maxCol, int& iterations, bool verbose) {
+    const int maxIterations = 10000;
+
+    while (true) {
+        const int col = chooseEnteringColumn(t, maxCol);
+        if (col == -1) return Status::Optimal;          // plus rien a gagner
+
+        const int row = chooseLeavingRow(t, col);
+        if (row == -1) return Status::Unbounded;        // colonne sans borne
+
+        if (verbose) {
+            std::cout << "  it " << iterations << " : "
+                      << t.names[col] << " entre, "
+                      << t.names[t.basis[row]] << " sort"
+                      << "  (pivot = " << t.a[row][col] << ")\n";
+        }
+
+        pivot(t, row, col);
+        ++iterations;
+
+        if (iterations >= maxIterations) {              // garde-fou anti-boucle infinie
+            std::cerr << "Attention : limite d'iterations atteinte.\n";
+            return Status::Optimal;
+        }
+    }
+}
+
+
+// Annule les couts reduits des variables de base, pour que la ligne objectif
+// soit exprimee uniquement en fonction des variables hors base.
+void makeCanonical(Tableau& t) {
+    for (int i = 0; i < t.m; ++i) {
+        const int    bv = t.basis[i];
+        const double rc = t.r[bv];
+        if (std::fabs(rc) < EPS) continue;
+
+        for (int j = 0; j < t.n; ++j) t.r[j] -= rc * t.a[i][j];
+        t.value -= rc * t.b[i];
+        t.r[bv] = 0.0;
+    }
+}
+
+// Apres une phase 1 reussie, une artificielle peut rester en base a la valeur 0.
+// On la remplace par une variable reelle ; si la ligne n'a que des zeros sur les
+// colonnes reelles, la contrainte etait redondante et on la laisse telle quelle.
+void driveOutArtificials(Tableau& t) {
+    for (int i = 0; i < t.m; ++i) {
+        if (t.basis[i] < t.firstArtificial) continue;
+
+        int col = -1;
+        for (int j = 0; j < t.firstArtificial; ++j) {
+            if (std::fabs(t.a[i][j]) > EPS) { col = j; break; }
+        }
+        if (col != -1) pivot(t, i, col);   // b[i] vaut 0 : la base reste realisable
+    }
+}
+
+// ===========================================================================
+//  3. La mise en forme standard : Problem -> Tableau
+//
+//     Plan des colonnes :
+//       [ 0 .. n-1 ]                    variables d'origine   x1, x2, ...
+//       [ n .. firstArtificial-1 ]      ecarts (+1) / surplus (-1)
+//       [ firstArtificial .. total-1 ]  artificielles
+// ===========================================================================
+
+Tableau buildTableau(const Problem& p) {
+    const int n = p.numVars();
+    const int m = p.numConstraints();
+
+    // --- 3a. copier les contraintes et imposer b >= 0 -----------------------
+    // On travaille sur des copies : le Problem d'entree n'est jamais modifie.
+    std::vector<std::vector<double>> rows(m, std::vector<double>(n, 0.0));
+    std::vector<double> rhs(m, 0.0);
+    std::vector<Sense>  sense(m, Sense::LessEqual);
+
+    for (int i = 0; i < m; ++i) {
+        const Constraint& c = p.constraints[i];
+        for (int j = 0; j < n; ++j) rows[i][j] = c.coeffs[j];
+        rhs[i]   = c.rhs;
+        sense[i] = c.sense;
+
+        if (rhs[i] < 0.0) {                     // on impose b >= 0
+            for (int j = 0; j < n; ++j) rows[i][j] = -rows[i][j];
+            rhs[i] = -rhs[i];
+            if      (sense[i] == Sense::LessEqual)    sense[i] = Sense::GreaterEqual;
+            else if (sense[i] == Sense::GreaterEqual) sense[i] = Sense::LessEqual;
+            // Equal reste Equal
+        }
+    }
+
+    // --- 3b. compter les colonnes, puis allouer ----------------------------
+    int numExtra = 0;   // ecarts + surplus
+    int numArt   = 0;   // artificielles
+    for (int i = 0; i < m; ++i) {
+        if (sense[i] != Sense::Equal)     ++numExtra;
+        if (sense[i] != Sense::LessEqual) ++numArt;
+    }
+
+    Tableau t;
+    t.m = m;
+    t.n = n + numExtra + numArt;
+    t.numOriginalVars = n;
+    t.firstArtificial = n + numExtra;
+
+    t.a.assign(m, std::vector<double>(t.n, 0.0));
+    t.b.assign(m, 0.0);
+    t.r.assign(t.n, 0.0);
+    t.basis.assign(m, -1);
+    t.names.assign(t.n, "");
+    for (int j = 0; j < n; ++j) t.names[j] = "x" + std::to_string(j + 1);
+
+    // --- 3c. remplir les lignes --------------------------------------------
+    int nextExtra = n;
+    int nextArt   = t.firstArtificial;
+
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) t.a[i][j] = rows[i][j];
+        t.b[i] = rhs[i];
+
+        if (sense[i] == Sense::LessEqual) {
+            t.a[i][nextExtra]  = 1.0;                          // ecart
+            t.names[nextExtra] = "s" + std::to_string(i + 1);
+            t.basis[i] = nextExtra;                            // l'ecart entre en base
+            ++nextExtra;
+
+        } else if (sense[i] == Sense::GreaterEqual) {
+            t.a[i][nextExtra]  = -1.0;                         // surplus
+            t.names[nextExtra] = "e" + std::to_string(i + 1);
+            ++nextExtra;
+            t.a[i][nextArt]  = 1.0;                            // artificielle
+            t.names[nextArt] = "a" + std::to_string(i + 1);
+            t.basis[i] = nextArt;                              // c'est ELLE qui entre en base
+            ++nextArt;
+
+        } else {                                               // Equal
+            t.a[i][nextArt]  = 1.0;
+            t.names[nextArt] = "a" + std::to_string(i + 1);
+            t.basis[i] = nextArt;
+            ++nextArt;
+        }
+    }
+
+    // --- 3d. ligne objectif -------------------------------------------------
+    // z + sum(r_j x_j) = value, donc r = -c en maximisation, +c en minimisation
+    for (int j = 0; j < n; ++j)
+        t.r[j] = (p.goal == Goal::Maximize) ? -p.cost[j] : p.cost[j];
+    t.value = 0.0;
+
+    return t;
+}
+
+// ===========================================================================
+//  4. Affichage
+// ===========================================================================
+
+void printTableau(const Tableau& t, const char* title) {
+    std::cout << "\n--- " << title << " ---\n";
+    std::cout << std::fixed << std::setprecision(2);
+
+    std::cout << std::setw(6) << "base";
+    for (int j = 0; j < t.n; ++j) std::cout << std::setw(9) << t.names[j];
+    std::cout << std::setw(10) << "b" << "\n";
+
+    for (int i = 0; i < t.m; ++i) {
+        std::cout << std::setw(6) << t.names[t.basis[i]];
+        for (int j = 0; j < t.n; ++j) std::cout << std::setw(9) << t.a[i][j];
+        std::cout << std::setw(10) << t.b[i] << "\n";
+    }
+
+    std::cout << std::setw(6) << "z";
+    for (int j = 0; j < t.n; ++j) std::cout << std::setw(9) << t.r[j];
+    std::cout << std::setw(10) << t.value << "\n";
+}
+
+}  // fin du namespace anonyme
+
+// ===========================================================================
+//  5. Interface publique (tout ce qui est declare dans simplex.hpp)
+// ===========================================================================
+
+const char* toString(Status s) {
+    switch (s) {
+        case Status::Optimal:    return "optimal";
+        case Status::Unbounded:  return "non borne";
+        case Status::Infeasible: return "infaisable";
+    }
+    return "inconnu";
+}
+
+Solution solve(const Problem& problem, bool verbose) {
+    Solution sol;
+    sol.x.assign(problem.numVars(), 0.0);
+
+    Tableau t = buildTableau(problem);
+    const int numArtificials = t.n - t.firstArtificial;
+
+    // ---------------- PHASE 1 : chasser les artificielles ------------------
+    if (numArtificials > 0) {
+        const std::vector<double> realR = t.r;      // on met l'objectif reel de cote
+
+        // objectif de phase 1 : max W = -(somme des artificielles)
+        for (int j = 0; j < t.n; ++j) t.r[j] = 0.0;
+        for (int j = t.firstArtificial; j < t.n; ++j) t.r[j] = 1.0;
+        t.value = 0.0;
+        makeCanonical(t);
+
+        if (verbose) printTableau(t, "Phase 1 - depart");
+        runSimplex(t, t.n, sol.iterations, verbose);
+
+        if (-t.value > EPS) {          // somme des artificielles = -value > 0
+            sol.status = Status::Infeasible;
+            return sol;
+        }
+
+        driveOutArtificials(t);
+
+        t.r     = realR;               // on remet l'objectif reel...
+        t.value = 0.0;
+        makeCanonical(t);              // ...et on le reexprime sur la base courante
+    }
+
+    // ---------------- PHASE 2 : optimiser pour de vrai ---------------------
+    if (verbose) printTableau(t, "Phase 2 - depart");
+    sol.status = runSimplex(t, t.firstArtificial, sol.iterations, verbose);
+    if (verbose) printTableau(t, "Tableau final");
+
+    if (sol.status == Status::Unbounded) return sol;
+
+    for (int i = 0; i < t.m; ++i)
+        if (t.basis[i] < t.numOriginalVars) sol.x[t.basis[i]] = t.b[i];
+
+    sol.value = (problem.goal == Goal::Maximize) ? t.value : -t.value;
+    return sol;
+}
+
+}  // namespace simplex
+
+
+\section{main}
+
+#include <iomanip>
+#include <iostream>
+#include "simplex.hpp"
+
+using namespace simplex;
+
+void run(const char* titre, const Problem& p) {
+    const Solution s = solve(p);
+
+    std::cout << "\n=== " << titre << " ===\n";
+    std::cout << "  statut     : " << toString(s.status) << "\n";
+    if (s.status == Status::Optimal) {
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "  solution   : ";
+        for (std::size_t j = 0; j < s.x.size(); ++j)
+            std::cout << "x" << j + 1 << " = " << s.x[j] << (j + 1 < s.x.size() ? ",  " : "");
+        std::cout << "\n  objectif   : z = " << s.value << "\n";
+    }
+    std::cout << "  iterations : " << s.iterations << "\n";
+}
+
+int main() {
+    { Problem p; p.goal = Goal::Maximize; p.cost = {3, 5};
+      p.constraints = { {{1,0}, Sense::LessEqual, 4}, {{0,2}, Sense::LessEqual, 12}, {{3,2}, Sense::LessEqual, 18} };
+      run("A. max 3x1+5x2, contraintes <=   [attendu z=36 en (2,6)]", p); }
+
+    { Problem p; p.goal = Goal::Minimize; p.cost = {2, 3};
+      p.constraints = { {{1,1}, Sense::GreaterEqual, 4}, {{1,3}, Sense::GreaterEqual, 6} };
+      run("B. min 2x1+3x2, contraintes >=   [attendu z=9 en (3,1)]", p); }
+
+    { Problem p; p.goal = Goal::Maximize; p.cost = {1, 1};
+      p.constraints = { {{-1,-1}, Sense::LessEqual, -2}, {{1,1}, Sense::Equal, 5}, {{1,0}, Sense::LessEqual, 3} };
+      run("C. b negatif + egalite            [attendu z=5]", p); }
+
+    { Problem p; p.goal = Goal::Maximize; p.cost = {1, 1};
+      p.constraints = { {{1,0}, Sense::GreaterEqual, 4}, {{1,0}, Sense::LessEqual, 2} };
+      run("D. x1>=4 et x1<=2                 [attendu INFAISABLE]", p); }
+
+    { Problem p; p.goal = Goal::Maximize; p.cost = {1, 1};
+      p.constraints = { {{1,-1}, Sense::LessEqual, 1} };
+      run("E. max x1+x2, x1-x2<=1            [attendu NON BORNE]", p); }
+
+    { Problem p; p.goal = Goal::Maximize; p.cost = {1, 1};
+      p.constraints = { {{1,1}, Sense::Equal, 5}, {{2,2}, Sense::Equal, 10}, {{1,0}, Sense::LessEqual, 3} };
+      run("F. contrainte redondante          [attendu z=5]", p); }
+
+    return 0;
+}
+
+
+
